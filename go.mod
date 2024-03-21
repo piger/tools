@@ -17,3 +17,5 @@ require (
 )
 
 require github.com/inconshreveable/mousetrap v1.1.0 // indirect
+
+replace github.com/gokrazy/tools => github.com/piger/tools v0.0.0-20231222080007-80a59f115332
