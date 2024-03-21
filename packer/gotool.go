@@ -2,6 +2,7 @@ package packer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -290,7 +291,7 @@ func (be *BuildEnv) Build(bindir string, packages []string, packageBuildFlags, p
 	incompletePkgs = append(incompletePkgs, packages...)
 	incompletePkgs = append(incompletePkgs, noBuildPackages...)
 
-	var eg errgroup.Group
+	eg, ctx := errgroup.WithContext(context.Background())
 	for _, incompleteNoBuildPkg := range noBuildPackages {
 		buildDir, err := be.BuildDir(incompleteNoBuildPkg)
 		if err != nil {
@@ -329,7 +330,7 @@ func (be *BuildEnv) Build(bindir string, packages []string, packageBuildFlags, p
 					args = append(args, buildFlags...)
 				}
 				args = append(args, pkg.ImportPath)
-				cmd := exec.Command("go", args...)
+				cmd := exec.CommandContext(ctx, "go", args...)
 				cmd.Env = Env()
 				cmd.Dir = buildDir
 				cmd.Stderr = os.Stderr
