@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -292,6 +293,19 @@ func (be *BuildEnv) Build(bindir string, packages []string, packageBuildFlags, p
 	incompletePkgs = append(incompletePkgs, noBuildPackages...)
 
 	eg, ctx := errgroup.WithContext(context.Background())
+
+	var limit int
+	if e := os.Getenv("GOKRAZY_MAX_PROCS"); e != "" {
+		l, err := strconv.Atoi(e)
+		if err != nil {
+			return err
+		}
+		limit = l
+	}
+	if limit > 0 {
+		eg.SetLimit(limit)
+	}
+
 	for _, incompleteNoBuildPkg := range noBuildPackages {
 		buildDir, err := be.BuildDir(incompleteNoBuildPkg)
 		if err != nil {
