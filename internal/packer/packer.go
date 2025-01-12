@@ -7,10 +7,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -94,15 +94,8 @@ func buildPackageMapFromFlags(cfg *config.Struct) map[string]bool {
 
 func buildPackagesFromFlags(cfg *config.Struct) []string {
 	var buildPackages []string
-	for _, pkg := range cfg.Packages {
-		buildPackages = append(buildPackages, pkg)
-	}
-	for _, pkg := range cfg.GokrazyPackagesOrDefault() {
-		if strings.TrimSpace(pkg) == "" {
-			continue
-		}
-		buildPackages = append(buildPackages, pkg)
-	}
+	buildPackages = append(buildPackages, cfg.Packages...)
+	buildPackages = append(buildPackages, getGokrazySystemPackages(cfg)...)
 	return buildPackages
 }
 
@@ -147,7 +140,7 @@ func findFlagFiles(cfg *config.Struct) (map[string][]string, error) {
 			lastModified: p.modTime,
 		})
 
-		b, err := ioutil.ReadFile(p.path)
+		b, err := os.ReadFile(p.path)
 		if err != nil {
 			return nil, err
 		}
@@ -199,7 +192,7 @@ func findBuildFlagsFiles(cfg *config.Struct) (map[string][]string, error) {
 			lastModified: p.modTime,
 		})
 
-		b, err := ioutil.ReadFile(p.path)
+		b, err := os.ReadFile(p.path)
 		if err != nil {
 			return nil, err
 		}
@@ -264,7 +257,7 @@ func findBuildTagsFiles(cfg *config.Struct) (map[string][]string, error) {
 			lastModified: p.modTime,
 		})
 
-		b, err := ioutil.ReadFile(p.path)
+		b, err := os.ReadFile(p.path)
 		if err != nil {
 			return nil, err
 		}
@@ -329,7 +322,7 @@ func findEnvFiles(cfg *config.Struct) (map[string][]string, error) {
 			lastModified: p.modTime,
 		})
 
-		b, err := ioutil.ReadFile(p.path)
+		b, err := os.ReadFile(p.path)
 		if err != nil {
 			return nil, err
 		}
@@ -487,7 +480,7 @@ func (ae *archiveExtraction) extractArchive(path string) (time.Time, error) {
 		default:
 			// TODO(optimization): do not hold file data in memory, instead
 			// stream the archive contents lazily to conserve RAM
-			b, err := ioutil.ReadAll(rd)
+			b, err := io.ReadAll(rd)
 			if err != nil {
 				return time.Time{}, err
 			}
@@ -498,7 +491,33 @@ func (ae *archiveExtraction) extractArchive(path string) (time.Time, error) {
 	return latestTime, nil
 }
 
-func findExtraFilesInDir(pkg, dir string, fi *FileInfo) error {
+// findExtraFilesInDir probes for extrafiles .tar files (possibly with an
+// architecture suffix like _amd64), or whether dir itself exists.
+func findExtraFilesInDir(dir string) (string, error) {
+	targetArch := packer.TargetArch()
+
+	var err error
+	for _, p := range []string{
+		dir + "_" + targetArch + ".tar",
+		dir + ".tar",
+		dir,
+	} {
+		_, err = os.Stat(p)
+		if err == nil {
+			return p, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return "", err // return last error
+}
+
+// TODO(cleanup): It would be nice to de-duplicate the path resolution logic
+// between findExtraFilesInDir and addExtraFilesFromDir. Maybe
+// findExtraFilesInDir could os.Open the file and pass the file handle to the
+// caller. That would prevent any TOCTOU problems.
+func addExtraFilesFromDir(pkg, dir string, fi *FileInfo) error {
 	ae := archiveExtraction{
 		dirs: make(map[string]*FileInfo),
 	}
@@ -578,9 +597,16 @@ func FindExtraFiles(cfg *config.Struct) (map[string][]*FileInfo, error) {
 						lastModified: st.ModTime(),
 					})
 				} else {
+					// Check if the ExtraFilePaths entry refers to an extrafiles
+					// .tar archive or an existing directory. If nothing can be
+					// found, report the error so the user can fix their config.
+					_, err := findExtraFilesInDir(path)
+					if err != nil {
+						return nil, fmt.Errorf("ExtraFilePaths of %s: %v", pkg, err)
+					}
 					// Copy a tarball or directory from the host
 					dir := mkdirp(root, dest)
-					if err := findExtraFilesInDir(pkg, path, dir); err != nil {
+					if err := addExtraFilesFromDir(pkg, path, dir); err != nil {
 						return nil, err
 					}
 				}
@@ -616,7 +642,7 @@ func FindExtraFiles(cfg *config.Struct) (map[string][]*FileInfo, error) {
 			// Look for extra files in $PWD/extrafiles/<pkg>/
 			dir := filepath.Join("extrafiles", pkg)
 			root := &FileInfo{}
-			if err := findExtraFilesInDir(pkg, dir, root); err != nil {
+			if err := addExtraFilesFromDir(pkg, dir, root); err != nil {
 				return nil, err
 			}
 			extraFiles[pkg] = append(extraFiles[pkg], root)
@@ -626,7 +652,7 @@ func FindExtraFiles(cfg *config.Struct) (map[string][]*FileInfo, error) {
 			dir := packageDirs[idx]
 			subdir := filepath.Join(dir, "_gokrazy", "extrafiles")
 			root := &FileInfo{}
-			if err := findExtraFilesInDir(pkg, subdir, root); err != nil {
+			if err := addExtraFilesFromDir(pkg, subdir, root); err != nil {
 				return nil, err
 			}
 			extraFiles[pkg] = append(extraFiles[pkg], root)
@@ -773,7 +799,7 @@ func partitionPath(base, num string) string {
 }
 
 func verifyNotMounted(dev string) error {
-	b, err := ioutil.ReadFile("/proc/self/mountinfo")
+	b, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // platform does not have /proc/self/mountinfo, fall back to not verifying
@@ -808,7 +834,7 @@ func (p *Pack) overwriteDevice(dev string, root *FileInfo, rootDeviceFiles []dev
 	}
 	defer f.Close()
 
-	if _, err := f.Seek(8192*512, io.SeekStart); err != nil {
+	if _, err := f.Seek(p.FirstPartitionOffsetSectors*512, io.SeekStart); err != nil {
 		return err
 	}
 
@@ -816,15 +842,15 @@ func (p *Pack) overwriteDevice(dev string, root *FileInfo, rootDeviceFiles []dev
 		return err
 	}
 
-	if err := writeMBR(&offsetReadSeeker{f, 8192 * 512}, f, p.Partuuid); err != nil {
+	if err := writeMBR(p.FirstPartitionOffsetSectors, &offsetReadSeeker{f, p.FirstPartitionOffsetSectors * 512}, f, p.Partuuid); err != nil {
 		return err
 	}
 
-	if _, err := f.Seek((8192+(100*MB/512))*512, io.SeekStart); err != nil {
+	if _, err := f.Seek((p.FirstPartitionOffsetSectors+(100*MB/512))*512, io.SeekStart); err != nil {
 		return err
 	}
 
-	tmp, err := ioutil.TempFile("", "gokr-packer")
+	tmp, err := os.CreateTemp("", "gokr-packer")
 	if err != nil {
 		return err
 	}
@@ -879,7 +905,7 @@ func (ors *offsetReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	return ors.ReadSeeker.Seek(offset, whence)
 }
 
-func (p *Pack) overwriteFile(filename string, root *FileInfo, rootDeviceFiles []deviceconfig.RootFile) (bootSize int64, rootSize int64, err error) {
+func (p *Pack) overwriteFile(root *FileInfo, rootDeviceFiles []deviceconfig.RootFile, firstPartitionOffsetSectors int64) (bootSize int64, rootSize int64, err error) {
 	f, err := os.Create(p.Cfg.InternalCompatibilityFlags.Overwrite)
 	if err != nil {
 		return 0, 0, err
@@ -893,7 +919,7 @@ func (p *Pack) overwriteFile(filename string, root *FileInfo, rootDeviceFiles []
 		return 0, 0, err
 	}
 
-	if _, err := f.Seek(8192*512, io.SeekStart); err != nil {
+	if _, err := f.Seek(p.FirstPartitionOffsetSectors*512, io.SeekStart); err != nil {
 		return 0, 0, err
 	}
 	var bs countingWriter
@@ -901,15 +927,15 @@ func (p *Pack) overwriteFile(filename string, root *FileInfo, rootDeviceFiles []
 		return 0, 0, err
 	}
 
-	if err := writeMBR(&offsetReadSeeker{f, 8192 * 512}, f, p.Partuuid); err != nil {
+	if err := writeMBR(p.FirstPartitionOffsetSectors, &offsetReadSeeker{f, p.FirstPartitionOffsetSectors * 512}, f, p.Partuuid); err != nil {
 		return 0, 0, err
 	}
 
-	if _, err := f.Seek(8192*512+100*MB, io.SeekStart); err != nil {
+	if _, err := f.Seek(p.FirstPartitionOffsetSectors*512+100*MB, io.SeekStart); err != nil {
 		return 0, 0, err
 	}
 
-	tmp, err := ioutil.TempFile("", "gokr-packer")
+	tmp, err := os.CreateTemp("", "gokr-packer")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -933,35 +959,11 @@ func (p *Pack) overwriteFile(filename string, root *FileInfo, rootDeviceFiles []
 	}
 
 	fmt.Printf("If your applications need to store persistent data, create a file system using e.g.:\n")
-	fmt.Printf("\t/sbin/mkfs.ext4 -F -E offset=%v %s %v\n", 8192*512+1100*MB, p.Cfg.InternalCompatibilityFlags.Overwrite, packer.PermSizeInKB(uint64(p.Cfg.InternalCompatibilityFlags.TargetStorageBytes)))
+	fmt.Printf("\t/sbin/mkfs.ext4 -F -E offset=%v %s %v\n", p.FirstPartitionOffsetSectors*512+1100*MB, p.Cfg.InternalCompatibilityFlags.Overwrite, packer.PermSizeInKB(firstPartitionOffsetSectors, uint64(p.Cfg.InternalCompatibilityFlags.TargetStorageBytes)))
 	fmt.Printf("\n")
 
 	return int64(bs), int64(rs), f.Close()
 }
-
-const usage = `
-gokr-packer packs gokrazy installations into SD card or file system images.
-
-Usage:
-To directly partition and overwrite an SD card:
-gokr-packer -overwrite=<device> <go-package> [<go-package>…]
-
-To create an SD card image on the file system:
-gokr-packer -overwrite=<file> -target_storage_bytes=<bytes> <go-package> [<go-package>…]
-
-To create a file system image of the boot or root file system:
-gokr-packer [-overwrite_boot=<file>|-overwrite_root=<file>] <go-package> [<go-package>…]
-
-To create file system images of both file systems:
-gokr-packer -overwrite_boot=<file> -overwrite_root=<file> <go-package> [<go-package>…]
-
-All of the above commands can be combined with the -update flag.
-
-To dump the auto-generated init source code (for use with -init_pkg later):
-gokr-packer -overwrite_init=<file> <go-package> [<go-package>…]
-
-Flags:
-`
 
 type OutputType string
 
@@ -1009,17 +1011,21 @@ func (pack *Pack) logic(programName string) error {
 	}
 
 	var mbrOnlyWithoutGpt bool
+	firstPartitionOffsetSectors := deviceconfig.DefaultBootPartitionStartLBA
 	var rootDeviceFiles []deviceconfig.RootFile
 	if cfg.DeviceType != "" {
 		if devcfg, ok := deviceconfig.GetDeviceConfigBySlug(cfg.DeviceType); ok {
 			rootDeviceFiles = devcfg.RootDeviceFiles
 			mbrOnlyWithoutGpt = devcfg.MBROnlyWithoutGPT
+			if devcfg.BootPartitionStartLBA != 0 {
+				firstPartitionOffsetSectors = devcfg.BootPartitionStartLBA
+			}
 		} else {
 			return fmt.Errorf("unknown device slug %q", cfg.DeviceType)
 		}
 	}
 
-	pack.Pack = packer.NewPackForHost(cfg.Hostname)
+	pack.Pack = packer.NewPackForHost(firstPartitionOffsetSectors, cfg.Hostname)
 
 	newInstallation := updateflag.NewInstallation()
 	useGPT := newInstallation && !mbrOnlyWithoutGpt
@@ -1071,7 +1077,7 @@ func (pack *Pack) logic(programName string) error {
 		return err
 	}
 
-	bindir, err := ioutil.TempDir("", "gokrazy-bins-")
+	bindir, err := os.MkdirTemp("", "gokrazy-bins-")
 	if err != nil {
 		return err
 	}
@@ -1241,7 +1247,7 @@ func (pack *Pack) logic(programName string) error {
 		update.Hostname = updateHostname
 	}
 
-	if update.HTTPPassword == "" {
+	if update.HTTPPassword == "" && !update.NoPassword {
 		pw, err := ensurePasswordFileExists(updateHostname, defaultPassword)
 		if err != nil {
 			return err
@@ -1249,9 +1255,29 @@ func (pack *Pack) logic(programName string) error {
 		update.HTTPPassword = pw
 	}
 
-	for _, dir := range []string{"dev", "etc", "proc", "sys", "tmp", "perm", "lib", "run", "var"} {
+	for _, dir := range []string{"bin", "dev", "etc", "proc", "sys", "tmp", "perm", "lib", "run", "mnt"} {
 		root.Dirents = append(root.Dirents, &FileInfo{
 			Filename: dir,
+		})
+	}
+
+	root.Dirents = append(root.Dirents, &FileInfo{
+		Filename:    "var",
+		SymlinkDest: "/perm/var",
+	})
+
+	mnt := root.mustFindDirent("mnt")
+	for _, md := range cfg.MountDevices {
+		if !strings.HasPrefix(md.Target, "/mnt/") {
+			continue
+		}
+		rest := strings.TrimPrefix(md.Target, "/mnt/")
+		rest = strings.TrimSuffix(rest, "/")
+		if strings.Contains(rest, "/") {
+			continue
+		}
+		mnt.Dirents = append(mnt.Dirents, &FileInfo{
+			Filename: rest,
 		})
 	}
 
@@ -1275,7 +1301,7 @@ func (pack *Pack) logic(programName string) error {
 	}
 
 	etc := root.mustFindDirent("etc")
-	tmpdir, err := ioutil.TempDir("", "gokrazy")
+	tmpdir, err := os.MkdirTemp("", "gokrazy")
 	if err != nil {
 		return err
 	}
@@ -1353,11 +1379,13 @@ func (pack *Pack) logic(programName string) error {
 
 	etc.Dirents = append(etc.Dirents, ssl)
 
-	etc.Dirents = append(etc.Dirents, &FileInfo{
-		Filename:    "gokr-pw.txt",
-		Mode:        0400,
-		FromLiteral: update.HTTPPassword,
-	})
+	if !update.NoPassword {
+		etc.Dirents = append(etc.Dirents, &FileInfo{
+			Filename:    "gokr-pw.txt",
+			Mode:        0400,
+			FromLiteral: update.HTTPPassword,
+		})
+	}
 
 	etc.Dirents = append(etc.Dirents, &FileInfo{
 		Filename:    "http-port.txt",
@@ -1383,6 +1411,14 @@ func (pack *Pack) logic(programName string) error {
 	etcGokrazy.Dirents = append(etcGokrazy.Dirents, &FileInfo{
 		Filename:    "sbom.json",
 		FromLiteral: string(sbom),
+	})
+	mountdevices, err := json.Marshal(cfg.MountDevices)
+	if err != nil {
+		return err
+	}
+	etcGokrazy.Dirents = append(etcGokrazy.Dirents, &FileInfo{
+		Filename:    "mountdevices.json",
+		FromLiteral: string(mountdevices),
 	})
 	etc.Dirents = append(etc.Dirents, etcGokrazy)
 
@@ -1501,7 +1537,7 @@ func (pack *Pack) logic(programName string) error {
 			fmt.Printf("To boot gokrazy, plug the SD card into a supported device (see https://gokrazy.org/platforms/)\n")
 			fmt.Printf("\n")
 		} else {
-			lower := 1200*MB + 8192
+			lower := 1200*MB + int(firstPartitionOffsetSectors)
 
 			if cfg.InternalCompatibilityFlags.TargetStorageBytes == 0 {
 				return fmt.Errorf("--target_storage_bytes is required (e.g. --target_storage_bytes=%d) when using overwrite with a file", lower)
@@ -1513,7 +1549,7 @@ func (pack *Pack) logic(programName string) error {
 				return fmt.Errorf("--target_storage_bytes must be at least %d (for boot + 2 root file systems + 100 MB /perm)", lower)
 			}
 
-			bootSize, rootSize, err = pack.overwriteFile(cfg.InternalCompatibilityFlags.Overwrite, root, rootDeviceFiles)
+			bootSize, rootSize, err = pack.overwriteFile(root, rootDeviceFiles, firstPartitionOffsetSectors)
 			if err != nil {
 				return err
 			}
@@ -1531,7 +1567,7 @@ func (pack *Pack) logic(programName string) error {
 		if cfg.InternalCompatibilityFlags.OverwriteBoot != "" {
 			mbrfn := cfg.InternalCompatibilityFlags.OverwriteMBR
 			if cfg.InternalCompatibilityFlags.OverwriteMBR == "" {
-				tmpMBR, err = ioutil.TempFile("", "gokrazy")
+				tmpMBR, err = os.CreateTemp("", "gokrazy")
 				if err != nil {
 					return err
 				}
@@ -1550,13 +1586,13 @@ func (pack *Pack) logic(programName string) error {
 		}
 
 		if cfg.InternalCompatibilityFlags.OverwriteBoot == "" && cfg.InternalCompatibilityFlags.OverwriteRoot == "" {
-			tmpMBR, err = ioutil.TempFile("", "gokrazy")
+			tmpMBR, err = os.CreateTemp("", "gokrazy")
 			if err != nil {
 				return err
 			}
 			defer os.Remove(tmpMBR.Name())
 
-			tmpBoot, err = ioutil.TempFile("", "gokrazy")
+			tmpBoot, err = os.CreateTemp("", "gokrazy")
 			if err != nil {
 				return err
 			}
@@ -1566,7 +1602,7 @@ func (pack *Pack) logic(programName string) error {
 				return err
 			}
 
-			tmpRoot, err = ioutil.TempFile("", "gokrazy")
+			tmpRoot, err = os.CreateTemp("", "gokrazy")
 			if err != nil {
 				return err
 			}
@@ -1655,7 +1691,7 @@ func (pack *Pack) logic(programName string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := bootFile.Seek(8192*512, io.SeekStart); err != nil {
+			if _, err := bootFile.Seek(firstPartitionOffsetSectors*512, io.SeekStart); err != nil {
 				return err
 			}
 			bootReader = &io.LimitedReader{
@@ -1667,7 +1703,7 @@ func (pack *Pack) logic(programName string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := rootFile.Seek(8192*512+100*MB, io.SeekStart); err != nil {
+			if _, err := rootFile.Seek(firstPartitionOffsetSectors*512+100*MB, io.SeekStart); err != nil {
 				return err
 			}
 			rootReader = &io.LimitedReader{
@@ -1820,7 +1856,7 @@ func (pack *Pack) logic(programName string) error {
 }
 
 // kernelGoarch returns the GOARCH value that corresponds to the provided
-// vmlinuz header. It returns one of "arm64", "arm", "amd64", or the empty
+// vmlinuz header. It returns one of "arm", "arm64", "386", "amd64" or the empty
 // string if not detected.
 func kernelGoarch(hdr []byte) string {
 	// Some constants from the file(1) command's magic.
@@ -1832,17 +1868,23 @@ func kernelGoarch(hdr []byte) string {
 		arm64Magic       = 0x644d5241
 		arm64MagicOffset = 0x38
 		// x86: https://github.com/file/file/blob/65be1904/magic/Magdir/linux#L137-L152
-		x86Magic       = 0xaa55
-		x86MagicOffset = 0x1fe
+		x86Magic            = 0xaa55
+		x86MagicOffset      = 0x1fe
+		x86XloadflagsOffset = 0x236
 	)
 	if len(hdr) >= arm64MagicOffset+4 && binary.LittleEndian.Uint32(hdr[arm64MagicOffset:]) == arm64Magic {
 		return "arm64"
 	}
-	if len(hdr) >= arm64MagicOffset+4 && binary.LittleEndian.Uint32(hdr[arm32MagicOffset:]) == arm32Magic {
+	if len(hdr) >= arm32MagicOffset+4 && binary.LittleEndian.Uint32(hdr[arm32MagicOffset:]) == arm32Magic {
 		return "arm"
 	}
-	if len(hdr) >= arm64MagicOffset+2 && binary.LittleEndian.Uint16(hdr[x86MagicOffset:]) == x86Magic {
-		return "amd64" // we'll assume 386 is unsupported
+	if len(hdr) >= x86XloadflagsOffset+2 && binary.LittleEndian.Uint16(hdr[x86MagicOffset:]) == x86Magic {
+		// XLF0 in arch/x86/boot/header.S
+		if hdr[x86XloadflagsOffset]&1 != 0 {
+			return "amd64"
+		} else {
+			return "386"
+		}
 	}
 	return ""
 }

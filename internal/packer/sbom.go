@@ -53,20 +53,11 @@ type SBOMWithHash struct {
 // not its internal implementation details
 // (i.e.  cfg.InternalCompatibilityFlags untouched).
 func GenerateSBOM(cfg *config.Struct) ([]byte, SBOMWithHash, error) {
-	wd, err := os.Getwd()
+	instancePath, err := os.Getwd()
 	if err != nil {
 		return nil, SBOMWithHash{}, err
 	}
-	defer os.Chdir(wd)
-	instancePath := config.InstancePath()
-	if err := os.Chdir(instancePath); err != nil {
-		if os.IsNotExist(err) {
-			// best-effort compatibility for old setups
-			instancePath = wd
-		} else {
-			return nil, SBOMWithHash{}, err
-		}
-	}
+	defer os.Chdir(instancePath)
 
 	formattedCfg, err := cfg.FormatForFile()
 	if err != nil {
@@ -102,7 +93,7 @@ func GenerateSBOM(cfg *config.Struct) ([]byte, SBOMWithHash, error) {
 				wd, _ := os.Getwd()
 				errStr := fmt.Sprintf("Error: build directory %q does not exist in %q\n", buildDir, wd)
 				errStr += fmt.Sprintf("Try 'gok -i %s add %s' followed by an update.\n", instanceflag.Instance(), pkg)
-				errStr += fmt.Sprintf("Afterwards, your 'gok sbom' command should work")
+				errStr += "Afterwards, your 'gok sbom' command should work"
 				return nil, SBOMWithHash{}, fmt.Errorf("%s: %w", errStr, err)
 			} else {
 				return nil, SBOMWithHash{}, err
@@ -152,17 +143,18 @@ func GenerateSBOM(cfg *config.Struct) ([]byte, SBOMWithHash, error) {
 			}
 		}
 
-		files := append([]*FileInfo{}, extraFiles[pkg]...)
-		if len(files) == 0 {
-			continue
-		}
-
+		// Restore the working directory before possibly 'continue'ing.
 		if err := os.Chdir(config.InstancePath()); err != nil {
 			if os.IsNotExist(err) {
 				// best-effort compatibility for old setups
 			} else {
 				return nil, SBOMWithHash{}, err
 			}
+		}
+
+		files := append([]*FileInfo{}, extraFiles[pkg]...)
+		if len(files) == 0 {
+			continue
 		}
 
 		for len(files) > 0 {

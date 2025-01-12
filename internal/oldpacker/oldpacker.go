@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gokrazy/internal/config"
+	"github.com/gokrazy/internal/deviceconfig"
 	"github.com/gokrazy/internal/tlsflag"
 	"github.com/gokrazy/internal/updateflag"
 	internalpacker "github.com/gokrazy/tools/internal/packer"
@@ -235,7 +236,7 @@ func logic(instanceDir string) error {
 
 func Main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, usage)
+		fmt.Fprint(os.Stderr, usage)
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -267,8 +268,18 @@ func Main() {
 	}
 
 	if os.Getenv("GOKR_PACKER_FD") != "" { // partitioning child process
+		firstPartitionOffsetSectors := deviceconfig.DefaultBootPartitionStartLBA
+		if *deviceType != "" {
+			if devcfg, ok := deviceconfig.GetDeviceConfigBySlug(*deviceType); ok {
+				if devcfg.BootPartitionStartLBA != 0 {
+					firstPartitionOffsetSectors = devcfg.BootPartitionStartLBA
+				}
+			} else {
+				log.Fatalf("unknown device slug %q", *deviceType)
+			}
+		}
 		p := internalpacker.Pack{
-			Pack: packer.NewPackForHost(*hostname),
+			Pack: packer.NewPackForHost(firstPartitionOffsetSectors, *hostname),
 		}
 
 		if _, err := p.SudoPartition(*overwrite); err != nil {

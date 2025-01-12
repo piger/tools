@@ -2,13 +2,13 @@ package packer
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -85,9 +85,7 @@ func InitDeps(initPkg string) []string {
 }
 
 func BuildDir(importPath string) string {
-	if strings.HasSuffix(importPath, "/...") {
-		importPath = strings.TrimSuffix(importPath, "/...")
-	}
+	importPath = strings.TrimSuffix(importPath, "/...")
 	buildDir := filepath.Join("builddir", importPath)
 
 	// Search for go.mod from most specific to least specific directory,
@@ -240,6 +238,7 @@ func getPkg(buildDir string, pkg string) error {
 			"list",
 			"-mod=mod",
 			"-e",
+			"-tags", "gokrazy",
 			"-f", "{{ .ImportPath }} {{ if .Incomplete }}error{{ else }}ok{{ end }}",
 		}, pkg)...)
 	cmd.Env = Env()
@@ -288,22 +287,14 @@ func (be *BuildEnv) Build(bindir string, packages []string, packageBuildFlags, p
 	done := measure.Interactively("building (go compiler)")
 	defer done("")
 
-	incompletePkgs := make([]string, 0, len(packages)+len(noBuildPackages))
-	incompletePkgs = append(incompletePkgs, packages...)
-	incompletePkgs = append(incompletePkgs, noBuildPackages...)
+	var eg errgroup.Group
 
-	eg, ctx := errgroup.WithContext(context.Background())
-
-	var limit int
-	if e := os.Getenv("GOKRAZY_MAX_PROCS"); e != "" {
-		l, err := strconv.Atoi(e)
-		if err != nil {
-			return err
+	if envLimit := os.Getenv("GOKRAZY_MAX_PROCS"); envLimit != "" {
+		if limit, err := strconv.Atoi(envLimit); err == nil {
+			eg.SetLimit(limit)
+		} else {
+			return fmt.Errorf("unparsable GOKRAXY_MAX_PROCS value: %w", err)
 		}
-		limit = l
-	}
-	if limit > 0 {
-		eg.SetLimit(limit)
 	}
 
 	for _, incompleteNoBuildPkg := range noBuildPackages {
@@ -336,7 +327,7 @@ func (be *BuildEnv) Build(bindir string, packages []string, packageBuildFlags, p
 				args := []string{
 					"build",
 					"-mod=mod",
-					"-o", filepath.Join(bindir, filepath.Base(pkg.Target)),
+					"-o", filepath.Join(bindir, pkg.Basename()),
 				}
 				tags := append(DefaultTags(), packageBuildTags[pkg.ImportPath]...)
 				args = append(args, "-tags="+strings.Join(tags, ","))
@@ -368,7 +359,32 @@ type Pkg struct {
 }
 
 func (p *Pkg) Basename() string {
-	return filepath.Base(p.Target)
+	if p.Target != "" {
+		return filepath.Base(p.Target)
+	}
+	// when GOBIN is set in the GOENV file, the target field is empty
+	// see https://github.com/gokrazy/tools/issues/71
+	base := path.Base(p.ImportPath)
+	if isVersionElement(base) {
+		return path.Base(path.Dir(p.ImportPath))
+	}
+	return base
+}
+
+// isVersionElement reports whether s is a well-formed path version element:
+// v2, v3, v10, etc, but not v0, v05, v1.
+// copied from https://github.com/golang/go/blob/go1.22.5/src/cmd/go/internal/load/pkg.go#L1338
+// governed by a BSD-style license
+func isVersionElement(s string) bool {
+	if len(s) < 2 || s[0] != 'v' || s[1] == '0' || s[1] == '1' && len(s) == 2 {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] < '0' || '9' < s[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (be *BuildEnv) mainPackage(pkg string) ([]Pkg, error) {

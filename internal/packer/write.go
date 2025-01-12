@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -27,10 +26,17 @@ import (
 	"github.com/gokrazy/tools/third_party/systemd-250.5-1"
 )
 
-func copyFile(fw *fat.Writer, dest string, src fs.File) error {
+func copyFile(fw *fat.Writer, dest string, src fs.File, srcName string) error {
 	st, err := src.Stat()
 	if err != nil {
 		return err
+	}
+	exists, err := fw.Exists(dest)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("copyFile(%s, %s): file already exists", dest, srcName)
 	}
 	w, err := fw.File(dest, st.ModTime())
 	if err != nil {
@@ -63,7 +69,7 @@ func copyFileSquash(d *squashfs.Directory, dest, src string) error {
 }
 
 func (p *Pack) writeCmdline(fw *fat.Writer, src string) error {
-	b, err := ioutil.ReadFile(src)
+	b, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
@@ -123,7 +129,7 @@ linux /vmlinuz
 }
 
 func (p *Pack) writeConfig(fw *fat.Writer, src string) error {
-	b, err := ioutil.ReadFile(src)
+	b, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
@@ -163,6 +169,7 @@ var (
 		"vmlinuz",
 		"*.dtb",
 		"overlays/*.dtbo",
+		"overlays/overlay_map.dtb",
 	}
 )
 
@@ -181,7 +188,7 @@ func (p *Pack) copyGlobsToBoot(fw *fat.Writer, srcDir string, globs []string) er
 			if err != nil {
 				return err
 			}
-			if err := copyFile(fw, "/"+relPath, src); err != nil {
+			if err := copyFile(fw, "/"+relPath, src, m); err != nil {
 				return err
 			}
 		}
@@ -330,7 +337,7 @@ func (p *Pack) writeBoot(f io.Writer, mbrfilename string) error {
 		if err != nil {
 			return err
 		}
-		if err := copyFile(fw, "/EFI/BOOT/BOOTX64.EFI", srcX86); err != nil {
+		if err := copyFile(fw, "/EFI/BOOT/BOOTX64.EFI", srcX86, "<embedded>"); err != nil {
 			return err
 		}
 
@@ -338,7 +345,7 @@ func (p *Pack) writeBoot(f io.Writer, mbrfilename string) error {
 		if err != nil {
 			return err
 		}
-		if err := copyFile(fw, "/EFI/BOOT/BOOTAA64.EFI", srcAA86); err != nil {
+		if err := copyFile(fw, "/EFI/BOOT/BOOTAA64.EFI", srcAA86, "<embedded>"); err != nil {
 			return err
 		}
 	}
@@ -365,7 +372,7 @@ func (p *Pack) writeBoot(f io.Writer, mbrfilename string) error {
 			return err
 		}
 		defer fmbr.Close()
-		if err := writeMBR(f.(io.ReadSeeker), fmbr, p.Partuuid); err != nil {
+		if err := writeMBR(p.FirstPartitionOffsetSectors, f.(io.ReadSeeker), fmbr, p.Partuuid); err != nil {
 			return err
 		}
 		if err := fmbr.Close(); err != nil {
@@ -587,7 +594,7 @@ func (p *Pack) writeRootDeviceFiles(f io.WriteSeeker, rootDeviceFiles []deviceco
 	return nil
 }
 
-func writeMBR(f io.ReadSeeker, fw io.WriteSeeker, partuuid uint32) error {
+func writeMBR(firstPartitionOffsetSectors int64, f io.ReadSeeker, fw io.WriteSeeker, partuuid uint32) error {
 	rd, err := fat.NewReader(f)
 	if err != nil {
 		return err
@@ -604,8 +611,8 @@ func writeMBR(f io.ReadSeeker, fw io.WriteSeeker, partuuid uint32) error {
 	if _, err := fw.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	vmlinuzLba := uint32((vmlinuzOffset / 512) + 8192)
-	cmdlineTxtLba := uint32((cmdlineOffset / 512) + 8192)
+	vmlinuzLba := uint32((vmlinuzOffset / 512) + firstPartitionOffsetSectors)
+	cmdlineTxtLba := uint32((cmdlineOffset / 512) + firstPartitionOffsetSectors)
 
 	fmt.Printf("MBR summary:\n")
 	fmt.Printf("  LBAs: vmlinuz=%d cmdline.txt=%d\n", vmlinuzLba, cmdlineTxtLba)
