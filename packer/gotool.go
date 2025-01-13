@@ -2,6 +2,7 @@ package packer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -287,7 +288,7 @@ func (be *BuildEnv) Build(bindir string, packages []string, packageBuildFlags, p
 	done := measure.Interactively("building (go compiler)")
 	defer done("")
 
-	var eg errgroup.Group
+	eg, ctx := errgroup.WithContext(context.Background())
 
 	if envLimit := os.Getenv("GOKRAZY_MAX_PROCS"); envLimit != "" {
 		if limit, err := strconv.Atoi(envLimit); err == nil {
